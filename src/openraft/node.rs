@@ -139,6 +139,7 @@ impl OpenRaftNode {
         runtime: OctopiiRuntime,
         transport: Arc<dyn Transport>,
         quic_transport: Option<Arc<crate::transport::QuicTransport>>,
+        custom_state_machine: Option<StateMachine>,
     ) -> Result<Self> {
         let rpc = Arc::new(crate::rpc::RpcHandler::new(Arc::clone(&transport)));
 
@@ -265,7 +266,8 @@ impl OpenRaftNode {
         #[cfg(feature = "openraft-filters")]
         let filters = Arc::new(OpenRaftFilters::new());
 
-        let state_machine: StateMachine = Arc::new(KvStateMachine::in_memory());
+        let state_machine: StateMachine = custom_state_machine
+            .unwrap_or_else(|| Arc::new(KvStateMachine::in_memory()));
         let state_machine_store = MemStateMachine::new_with_wal(state_machine.clone(), meta_wal)
             .await;
 
@@ -334,7 +336,7 @@ impl OpenRaftNode {
         let quic_transport =
             Arc::new(crate::transport::QuicTransport::new(config.bind_addr).await?);
         let transport: Arc<dyn Transport> = quic_transport.clone();
-        Self::new_with_transport(config, runtime, transport, Some(quic_transport)).await
+        Self::new_with_transport(config, runtime, transport, Some(quic_transport), None).await
     }
 
     #[cfg(feature = "simulation")]
@@ -343,7 +345,7 @@ impl OpenRaftNode {
         runtime: OctopiiRuntime,
         transport: Arc<dyn Transport>,
     ) -> Result<Self> {
-        Self::new_with_transport(config, runtime, transport, None).await
+        Self::new_with_transport(config, runtime, transport, None, None).await
     }
 
     pub fn new_blocking(config: Config) -> Result<Self> {
@@ -366,9 +368,10 @@ impl OpenRaftNode {
         runtime: OctopiiRuntime,
         state_machine: StateMachine,
     ) -> Result<Self> {
-        let mut node = Self::new(config, runtime).await?;
-        node.state_machine = state_machine;
-        Ok(node)
+        let quic_transport =
+            Arc::new(crate::transport::QuicTransport::new(config.bind_addr).await?);
+        let transport: Arc<dyn Transport> = quic_transport.clone();
+        Self::new_with_transport(config, runtime, transport, Some(quic_transport), Some(state_machine)).await
     }
 
     pub async fn log_state(&self) -> std::result::Result<LogState<AppTypeConfig>, io::Error> {
