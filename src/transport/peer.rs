@@ -2,7 +2,7 @@ use crate::chunk::ChunkSource;
 use crate::error::{OctopiiError, Result};
 use super::{Peer, TransportFut};
 use bytes::{Bytes, BytesMut};
-use quinn::Connection;
+use quinn::{Connection, SendStream};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use tokio::fs::File;
@@ -11,6 +11,59 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// A connection to a peer
 pub struct PeerConnection {
     connection: Connection,
+}
+
+enum RecvChunkMode {
+    Memory,
+    File(std::path::PathBuf),
+}
+
+enum RecvChunkResult {
+    Memory(Bytes),
+    File(u64),
+}
+
+enum ChunkSink {
+    Memory(BytesMut),
+    File(File),
+}
+
+impl ChunkSink {
+    fn memory(total_size: u64) -> Self {
+        let cap = std::cmp::min(total_size as usize, 10 * 1024 * 1024);
+        ChunkSink::Memory(BytesMut::with_capacity(cap))
+    }
+
+    async fn file(path: std::path::PathBuf) -> Result<Self> {
+        let file = File::create(path)
+            .await
+            .map_err(|e| OctopiiError::Transport(format!("Failed to create file: {}", e)))?;
+        Ok(ChunkSink::File(file))
+    }
+
+    async fn write_chunk(&mut self, buf: &[u8]) -> Result<()> {
+        match self {
+            ChunkSink::Memory(data) => {
+                data.extend_from_slice(buf);
+                Ok(())
+            }
+            ChunkSink::File(file) => file.write_all(buf).await.map_err(|e| {
+                OctopiiError::Transport(format!("File write failed: {}", e))
+            }),
+        }
+    }
+
+    async fn finish(self, received: u64) -> Result<RecvChunkResult> {
+        match self {
+            ChunkSink::Memory(data) => Ok(RecvChunkResult::Memory(data.freeze())),
+            ChunkSink::File(mut file) => {
+                file.flush()
+                    .await
+                    .map_err(|e| OctopiiError::Transport(format!("Flush failed: {}", e)))?;
+                Ok(RecvChunkResult::File(received))
+            }
+        }
+    }
 }
 
 impl PeerConnection {
@@ -180,90 +233,31 @@ impl PeerConnection {
     ///
     /// Returns the received chunk data in memory
     pub async fn recv_chunk_verified(&self) -> Result<Option<Bytes>> {
-        const BUFFER_SIZE: usize = 64 * 1024; // 64KB buffer
-
-        let (mut send_stream, mut recv_stream) = match self.connection.accept_bi().await {
-            Ok(stream) => stream,
-            Err(quinn::ConnectionError::ApplicationClosed(_)) => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
-
-        // Read size
-        let mut size_buf = [0u8; 8];
-        if let Err(e) = recv_stream.read_exact(&mut size_buf).await {
-            // Send error ACK
-            let _ = send_stream.write_all(&[2u8]).await;
-            return Err(OctopiiError::Transport(format!(
-                "Failed to read size: {}",
-                e
-            )));
+        let result = self.recv_chunk_impl(RecvChunkMode::Memory).await?;
+        match result {
+            Some(RecvChunkResult::Memory(bytes)) => Ok(Some(bytes)),
+            Some(RecvChunkResult::File(_)) => Err(OctopiiError::Transport(
+                "Unexpected file result for memory receive".to_string(),
+            )),
+            None => Ok(None),
         }
-        let total_size = u64::from_le_bytes(size_buf);
-
-        // Stream data and compute checksum
-        let mut hasher = Sha256::new();
-        let mut data =
-            BytesMut::with_capacity(std::cmp::min(total_size as usize, 10 * 1024 * 1024)); // Cap at 10MB for initial allocation
-        let mut received = 0u64;
-        let mut buffer = vec![0u8; BUFFER_SIZE];
-
-        while received < total_size {
-            let to_read = std::cmp::min(BUFFER_SIZE, (total_size - received) as usize);
-            match recv_stream.read(&mut buffer[..to_read]).await {
-                Ok(Some(n)) => {
-                    hasher.update(&buffer[..n]);
-                    data.extend_from_slice(&buffer[..n]);
-                    received += n as u64;
-                }
-                Ok(None) => {
-                    // Stream closed before we read everything
-                    let _ = send_stream.write_all(&[2u8]).await;
-                    return Err(OctopiiError::Transport("Unexpected EOF".to_string()));
-                }
-                Err(e) => {
-                    let _ = send_stream.write_all(&[2u8]).await;
-                    return Err(OctopiiError::Transport(format!("Read error: {}", e)));
-                }
-            }
-        }
-
-        // Read checksum
-        let mut received_checksum = [0u8; 32];
-        if let Err(e) = recv_stream.read_exact(&mut received_checksum).await {
-            let _ = send_stream.write_all(&[2u8]).await;
-            return Err(OctopiiError::Transport(format!(
-                "Failed to read checksum: {}",
-                e
-            )));
-        }
-
-        // Verify checksum
-        let computed_checksum = hasher.finalize();
-        if &computed_checksum[..] != &received_checksum {
-            // Send checksum mismatch ACK
-            send_stream
-                .write_all(&[1u8])
-                .await
-                .map_err(|e| OctopiiError::Transport(format!("Failed to send ACK: {}", e)))?;
-            return Err(OctopiiError::Transport(
-                "Checksum verification failed".to_string(),
-            ));
-        }
-
-        // Send success ACK
-        send_stream
-            .write_all(&[0u8])
-            .await
-            .map_err(|e| OctopiiError::Transport(format!("Failed to send ACK: {}", e)))?;
-        send_stream
-            .finish()
-            .map_err(|e| OctopiiError::Transport(format!("Stream closed: {}", e)))?;
-
-        Ok(Some(data.freeze()))
     }
 
     /// Receive a chunk and stream it directly to disk, acknowledging checksum.
     pub async fn recv_chunk_to_path<P: AsRef<Path>>(&self, path: P) -> Result<Option<u64>> {
+        let result = self
+            .recv_chunk_impl(RecvChunkMode::File(path.as_ref().to_path_buf()))
+            .await?;
+        match result {
+            Some(RecvChunkResult::File(bytes)) => Ok(Some(bytes)),
+            Some(RecvChunkResult::Memory(_)) => Err(OctopiiError::Transport(
+                "Unexpected memory result for file receive".to_string(),
+            )),
+            None => Ok(None),
+        }
+    }
+
+    async fn recv_chunk_impl(&self, mode: RecvChunkMode) -> Result<Option<RecvChunkResult>> {
         const BUFFER_SIZE: usize = 64 * 1024;
 
         let (mut send_stream, mut recv_stream) = match self.connection.accept_bi().await {
@@ -274,7 +268,7 @@ impl PeerConnection {
 
         let mut size_buf = [0u8; 8];
         if let Err(e) = recv_stream.read_exact(&mut size_buf).await {
-            let _ = send_stream.write_all(&[2u8]).await;
+            let _ = send_error_ack(&mut send_stream).await;
             return Err(OctopiiError::Transport(format!(
                 "Failed to read size: {}",
                 e
@@ -282,15 +276,16 @@ impl PeerConnection {
         }
         let total_size = u64::from_le_bytes(size_buf);
 
-        let mut file = match File::create(path).await {
-            Ok(f) => f,
-            Err(e) => {
-                let _ = send_stream.write_all(&[2u8]).await;
-                return Err(OctopiiError::Transport(format!(
-                    "Failed to create file: {}",
-                    e
-                )));
-            }
+        let finish_stream = matches!(mode, RecvChunkMode::Memory);
+        let mut sink = match mode {
+            RecvChunkMode::Memory => ChunkSink::memory(total_size),
+            RecvChunkMode::File(path) => match ChunkSink::file(path).await {
+                Ok(sink) => sink,
+                Err(err) => {
+                    let _ = send_error_ack(&mut send_stream).await;
+                    return Err(err);
+                }
+            },
         };
 
         let mut hasher = Sha256::new();
@@ -301,17 +296,15 @@ impl PeerConnection {
             match recv_stream.read(&mut buffer[..to_read]).await {
                 Ok(Some(n)) => {
                     hasher.update(&buffer[..n]);
-                    file.write_all(&buffer[..n]).await.map_err(|e| {
-                        OctopiiError::Transport(format!("File write failed: {}", e))
-                    })?;
+                    sink.write_chunk(&buffer[..n]).await?;
                     received += n as u64;
                 }
                 Ok(None) => {
-                    let _ = send_stream.write_all(&[2u8]).await;
+                    let _ = send_error_ack(&mut send_stream).await;
                     return Err(OctopiiError::Transport("Unexpected EOF".to_string()));
                 }
                 Err(e) => {
-                    let _ = send_stream.write_all(&[2u8]).await;
+                    let _ = send_error_ack(&mut send_stream).await;
                     return Err(OctopiiError::Transport(format!("Read error: {}", e)));
                 }
             }
@@ -319,7 +312,7 @@ impl PeerConnection {
 
         let mut received_checksum = [0u8; 32];
         if let Err(e) = recv_stream.read_exact(&mut received_checksum).await {
-            let _ = send_stream.write_all(&[2u8]).await;
+            let _ = send_error_ack(&mut send_stream).await;
             return Err(OctopiiError::Transport(format!(
                 "Failed to read checksum: {}",
                 e
@@ -328,23 +321,34 @@ impl PeerConnection {
 
         let computed_checksum = hasher.finalize();
         if &computed_checksum[..] != &received_checksum {
-            let _ = send_stream.write_all(&[1u8]).await;
+            let _ = send_checksum_fail_ack(&mut send_stream).await;
             return Err(OctopiiError::Transport(
                 "Checksum verification failed".to_string(),
             ));
         }
 
-        file.flush()
-            .await
-            .map_err(|e| OctopiiError::Transport(format!("Flush failed: {}", e)))?;
-
         send_stream
             .write_all(&[0u8])
             .await
             .map_err(|e| OctopiiError::Transport(format!("Failed to send ACK: {}", e)))?;
+        if finish_stream {
+            send_stream
+                .finish()
+                .map_err(|e| OctopiiError::Transport(format!("Stream closed: {}", e)))?;
+        }
 
-        Ok(Some(received))
+        Ok(Some(sink.finish(received).await?))
     }
+}
+
+async fn send_error_ack(send_stream: &mut SendStream) -> Result<()> {
+    let _ = send_stream.write_all(&[2u8]).await;
+    Ok(())
+}
+
+async fn send_checksum_fail_ack(send_stream: &mut SendStream) -> Result<()> {
+    let _ = send_stream.write_all(&[1u8]).await;
+    Ok(())
 }
 
 impl Peer for PeerConnection {

@@ -17,6 +17,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
+use crate::sim_time;
 
 pub type TransportFut<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
@@ -226,7 +227,7 @@ mod tests {
         });
 
         // Give accept() time to start
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        sim_time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         // Connect from transport1 to transport2
         let peer = transport1.connect(actual_addr2).await.unwrap();

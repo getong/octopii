@@ -17,19 +17,27 @@ impl ShippingLane {
         Self { transport }
     }
 
+    async fn send_chunk(
+        &self,
+        addr: SocketAddr,
+        chunk: ChunkSource,
+    ) -> Result<TransferResult> {
+        let peer = self.transport.connect(addr).await?;
+        let start = sim_time::now();
+        match peer.send_chunk_verified(&chunk).await {
+            Ok(bytes) => Ok(TransferResult::success(addr, bytes, sim_time::elapsed(start))),
+            Err(err) => Ok(TransferResult::failure(addr, err.to_string())),
+        }
+    }
+
     /// Send a file to a peer, returning a `TransferResult`.
     pub async fn send_file<P: AsRef<Path>>(
         &self,
         addr: SocketAddr,
         path: P,
     ) -> Result<TransferResult> {
-        let peer = self.transport.connect(addr).await?;
         let chunk = ChunkSource::File(path.as_ref().to_path_buf());
-        let start = sim_time::now();
-        match peer.send_chunk_verified(&chunk).await {
-            Ok(bytes) => Ok(TransferResult::success(addr, bytes, sim_time::elapsed(start))),
-            Err(err) => Ok(TransferResult::failure(addr, err.to_string())),
-        }
+        self.send_chunk(addr, chunk).await
     }
 
     /// Receive a file from a peer and write it to `dest`.
@@ -51,13 +59,8 @@ impl ShippingLane {
 
     /// Send an in-memory payload to a peer.
     pub async fn send_memory(&self, addr: SocketAddr, payload: Bytes) -> Result<TransferResult> {
-        let peer = self.transport.connect(addr).await?;
         let chunk = ChunkSource::Memory(payload);
-        let start = sim_time::now();
-        match peer.send_chunk_verified(&chunk).await {
-            Ok(bytes) => Ok(TransferResult::success(addr, bytes, sim_time::elapsed(start))),
-            Err(err) => Ok(TransferResult::failure(addr, err.to_string())),
-        }
+        self.send_chunk(addr, chunk).await
     }
 
     /// Receive a chunk into memory.

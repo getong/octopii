@@ -6,11 +6,9 @@ use crate::rpc::{RequestPayload, ResponsePayload, RpcHandler};
 use openraft::{
     error::RPCError,
     network::{RaftNetwork, RaftNetworkFactory},
-    raft::{
-        AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
-        InstallSnapshotResponse, VoteRequest, VoteResponse,
-    },
+    raft::{AppendEntriesRequest, AppendEntriesResponse, VoteRequest, VoteResponse},
 };
+use serde::{de::DeserializeOwned, Serialize};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -150,19 +148,21 @@ impl QuinnNetwork {
 
         Ok(resp.payload)
     }
-}
 
-impl openraft::network::v2::RaftNetworkV2<AppTypeConfig> for QuinnNetwork {
-    async fn append_entries(
-        &mut self,
-        req: AppendEntriesRequest<AppTypeConfig>,
-        _option: openraft::network::RPCOption,
-    ) -> Result<AppendEntriesResponse<AppTypeConfig>, RPCError<AppTypeConfig>> {
-        let data = bincode::serialize(&req)
+    async fn rpc_request<Req, Resp>(
+        &self,
+        kind: &str,
+        req: &Req,
+    ) -> Result<Resp, RPCError<AppTypeConfig>>
+    where
+        Req: Serialize,
+        Resp: DeserializeOwned,
+    {
+        let data = bincode::serialize(req)
             .map_err(|e| RPCError::Network(openraft::error::NetworkError::new(&e)))?;
 
         let resp_payload = self
-            .send_openraft("append_entries", data)
+            .send_openraft(kind, data)
             .await
             .map_err(|e| {
                 RPCError::Unreachable(openraft::error::Unreachable::new(&io::Error::new(
@@ -172,7 +172,7 @@ impl openraft::network::v2::RaftNetworkV2<AppTypeConfig> for QuinnNetwork {
             })?;
 
         match resp_payload {
-            ResponsePayload::OpenRaft { kind, data } if kind == "append_entries" => {
+            ResponsePayload::OpenRaft { kind: resp_kind, data } if resp_kind == kind => {
                 bincode::deserialize(&data)
                     .map_err(|e| RPCError::Network(openraft::error::NetworkError::new(&e)))
             }
@@ -183,6 +183,16 @@ impl openraft::network::v2::RaftNetworkV2<AppTypeConfig> for QuinnNetwork {
                 ),
             ))),
         }
+    }
+}
+
+impl openraft::network::v2::RaftNetworkV2<AppTypeConfig> for QuinnNetwork {
+    async fn append_entries(
+        &mut self,
+        req: AppendEntriesRequest<AppTypeConfig>,
+        _option: openraft::network::RPCOption,
+    ) -> Result<AppendEntriesResponse<AppTypeConfig>, RPCError<AppTypeConfig>> {
+        self.rpc_request("append_entries", &req).await
     }
 
     async fn full_snapshot(
@@ -218,53 +228,16 @@ impl openraft::network::v2::RaftNetworkV2<AppTypeConfig> for QuinnNetwork {
             req.vote
         );
 
-        let data = bincode::serialize(&req).map_err(|e| {
-            tracing::error!(
-                "Failed to serialize vote request {}->{}: {}",
-                self.self_id,
-                self.target,
-                e
-            );
-            RPCError::Network(openraft::error::NetworkError::new(&e))
-        })?;
-
         tracing::debug!("Sending vote RPC {}->{}", self.self_id, self.target);
-        let resp_payload = self.send_openraft("vote", data).await.map_err(|e| {
-            tracing::error!("Vote RPC {}->{} failed: {}", self.self_id, self.target, e);
-            RPCError::Unreachable(openraft::error::Unreachable::new(&io::Error::new(
-                io::ErrorKind::Other,
-                e,
-            )))
-        })?;
-
+        let resp = match self.rpc_request("vote", &req).await {
+            Ok(resp) => resp,
+            Err(err) => {
+                tracing::error!("Vote RPC {}->{} failed: {}", self.self_id, self.target, err);
+                return Err(err);
+            }
+        };
         tracing::debug!("Received vote response {}->{}", self.self_id, self.target);
-        match resp_payload {
-            ResponsePayload::OpenRaft { kind, data } if kind == "vote" => {
-                bincode::deserialize(&data).map_err(|e| {
-                    tracing::error!(
-                        "Failed to deserialize vote response {}->{}: {}",
-                        self.self_id,
-                        self.target,
-                        e
-                    );
-                    RPCError::Network(openraft::error::NetworkError::new(&e))
-                })
-            }
-            other => {
-                tracing::error!(
-                    "Unexpected vote response {}->{}: {:?}",
-                    self.self_id,
-                    self.target,
-                    other
-                );
-                Err(RPCError::Unreachable(openraft::error::Unreachable::new(
-                    &io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("unexpected response: {:?}", other),
-                    ),
-                )))
-            }
-        }
+        Ok(resp)
     }
 }
 

@@ -3,6 +3,18 @@ use quinn::{ClientConfig, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::sync::Arc;
 
+fn ensure_crypto_provider() {
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+}
+
+fn default_transport_config() -> quinn::TransportConfig {
+    let mut transport_config = quinn::TransportConfig::default();
+    transport_config.max_concurrent_bidi_streams(1024u32.into());
+    transport_config.max_concurrent_uni_streams(1024u32.into());
+    transport_config
+}
+
 /// Generate a self-signed certificate
 pub fn generate_self_signed_cert() -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
@@ -20,8 +32,7 @@ pub fn create_server_config(
     key: PrivateKeyDer<'static>,
 ) -> Result<ServerConfig> {
     // Install crypto provider if not already installed
-    let _ =
-        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    ensure_crypto_provider();
 
     let mut crypto = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -37,11 +48,7 @@ pub fn create_server_config(
     ));
 
     // Performance tuning
-    let mut transport_config = quinn::TransportConfig::default();
-    transport_config.max_concurrent_bidi_streams(1024u32.into());
-    transport_config.max_concurrent_uni_streams(1024u32.into());
-
-    server_config.transport_config(Arc::new(transport_config));
+    server_config.transport_config(Arc::new(default_transport_config()));
 
     Ok(server_config)
 }
@@ -49,8 +56,7 @@ pub fn create_server_config(
 /// Create client config that accepts any certificate (for simplicity)
 pub fn create_client_config() -> Result<ClientConfig> {
     // Install crypto provider if not already installed
-    let _ =
-        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    ensure_crypto_provider();
 
     // For a minimal setup, we'll accept any certificate
     // In production, you'd want proper certificate validation
@@ -68,11 +74,7 @@ pub fn create_client_config() -> Result<ClientConfig> {
     ));
 
     // Performance tuning
-    let mut transport_config = quinn::TransportConfig::default();
-    transport_config.max_concurrent_bidi_streams(1024u32.into());
-    transport_config.max_concurrent_uni_streams(1024u32.into());
-
-    client_config.transport_config(Arc::new(transport_config));
+    client_config.transport_config(Arc::new(default_transport_config()));
 
     Ok(client_config)
 }

@@ -56,6 +56,28 @@ impl Default for MemLogStoreInner {
 }
 
 impl MemLogStoreInner {
+    fn remove_through(&mut self, end: u64) {
+        let keys = self
+            .log
+            .range(..=end)
+            .map(|(k, _v)| *k)
+            .collect::<Vec<_>>();
+        for key in keys {
+            self.log.remove(&key);
+        }
+    }
+
+    fn remove_from(&mut self, start: u64) {
+        let keys = self
+            .log
+            .range(start..)
+            .map(|(k, _v)| *k)
+            .collect::<Vec<_>>();
+        for key in keys {
+            self.log.remove(&key);
+        }
+    }
+
     async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug>(
         &mut self,
         range: RB,
@@ -121,14 +143,7 @@ impl MemLogStoreInner {
     }
 
     async fn truncate(&mut self, log_id: LogId<AppTypeConfig>) -> Result<(), io::Error> {
-        let keys = self
-            .log
-            .range(log_id.index..)
-            .map(|(k, _v)| *k)
-            .collect::<Vec<_>>();
-        for key in keys {
-            self.log.remove(&key);
-        }
+        self.remove_from(log_id.index);
         Ok(())
     }
 
@@ -140,14 +155,7 @@ impl MemLogStoreInner {
         }
 
         {
-            let keys = self
-                .log
-                .range(..=log_id.index)
-                .map(|(k, _v)| *k)
-                .collect::<Vec<_>>();
-            for key in keys {
-                self.log.remove(&key);
-            }
+            self.remove_through(log_id.index);
         }
 
         Ok(())
@@ -339,27 +347,7 @@ impl MemStateMachine {
         if let Some(ref wal) = self.meta_wal {
             let data = bincode::serialize(record)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-            #[cfg(feature = "simulation")]
-            {
-                // Retry on transient I/O errors in simulation
-                for attempt in 0..20 {
-                    match wal.append(Bytes::from(data.clone())).await {
-                        Ok(_) => return Ok(()),
-                        Err(e) => {
-                            if attempt == 19 {
-                                return Err(io::Error::new(io::ErrorKind::Other, e.to_string()));
-                            }
-                            sim_runtime::advance_time(Duration::from_millis(10));
-                            yield_now().await;
-                        }
-                    }
-                }
-            }
-            #[cfg(not(feature = "simulation"))]
-            {
-                wal.append(Bytes::from(data)).await
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-            }
+            append_wal_record(wal, Bytes::from(data)).await?;
         }
         Ok(())
     }
@@ -585,6 +573,14 @@ impl WalLogStore {
     }
 
     fn sim_assert_log_store_state(inner: &MemLogStoreInner) {
+        Self::sim_assert_log_entries(inner);
+        Self::sim_assert_committed(inner);
+        Self::sim_assert_log_gaps(inner);
+        Self::sim_assert_log_continuity(inner);
+        Self::sim_assert_committed_accessible(inner);
+    }
+
+    fn sim_assert_log_entries(inner: &MemLogStoreInner) {
         let last_log_id = inner.log.iter().next_back().map(|(_, entry)| entry.log_id);
         if let Some(purged) = inner.last_purged_log_id.clone() {
             crate::invariants::sim_assert(
@@ -609,9 +605,12 @@ impl WalLogStore {
                 );
             }
         }
+    }
 
+    fn sim_assert_committed(inner: &MemLogStoreInner) {
         if let Some(committed) = inner.committed {
             // committed must be <= last_log_id, OR if log is empty, <= last_purged
+            let last_log_id = inner.log.iter().next_back().map(|(_, entry)| entry.log_id);
             let committed_valid = match last_log_id {
                 Some(last) => committed <= last,
                 None => inner
@@ -630,7 +629,9 @@ impl WalLogStore {
                 );
             }
         }
+    }
 
+    fn sim_assert_log_gaps(inner: &MemLogStoreInner) {
         // Invariant #6: Log continuity - no gaps between entries
         if let (Some(first_idx), Some(last_idx)) =
             (inner.log.keys().next().copied(), inner.log.keys().next_back().copied())
@@ -641,7 +642,9 @@ impl WalLogStore {
                 "log has gaps between first and last entry",
             );
         }
+    }
 
+    fn sim_assert_log_continuity(inner: &MemLogStoreInner) {
         // Invariant #7: First entry immediately follows purged index
         if let Some(purged) = inner.last_purged_log_id.clone() {
             if let Some(first_idx) = inner.log.keys().next().copied() {
@@ -651,7 +654,9 @@ impl WalLogStore {
                 );
             }
         }
+    }
 
+    fn sim_assert_committed_accessible(inner: &MemLogStoreInner) {
         // Invariant #8: Committed entry is accessible (in log or purged)
         if let Some(committed) = inner.committed {
             let in_log = inner.log.contains_key(&committed.index);
@@ -701,21 +706,21 @@ impl WalLogStore {
     /// 3. Ensure purged <= last_log_id (by clearing invalid purge)
     /// 4. If committed points to a lost entry, roll it back
     fn repair_state_after_recovery(inner: &mut MemLogStoreInner) {
+        Self::drop_entries_before_purge(inner);
+        Self::truncate_at_first_gap(inner);
+        Self::drop_log_if_purge_inconsistent(inner);
+        Self::repair_committed_after_recovery(inner);
+    }
+
+    fn drop_entries_before_purge(inner: &mut MemLogStoreInner) {
         // Step 1: Remove entries at or before purge point
         // Note: Use clone() since LogId doesn't implement Copy
         if let Some(ref purged) = inner.last_purged_log_id {
-            let purge_idx = purged.index;
-            let keys_to_remove: Vec<u64> = inner
-                .log
-                .keys()
-                .filter(|&&k| k <= purge_idx)
-                .copied()
-                .collect();
-            for key in keys_to_remove {
-                inner.log.remove(&key);
-            }
+            inner.remove_through(purged.index);
         }
+    }
 
+    fn truncate_at_first_gap(inner: &mut MemLogStoreInner) {
         // Step 2: Find and truncate at first gap in log
         // Log must be contiguous - if there's a gap, entries after the gap are invalid
         let expected_first = match inner.last_purged_log_id.as_ref() {
@@ -772,7 +777,9 @@ impl WalLogStore {
         for key in keys_to_remove {
             inner.log.remove(&key);
         }
+    }
 
+    fn drop_log_if_purge_inconsistent(inner: &mut MemLogStoreInner) {
         // Step 3: Ensure purged <= last_log_id (clear invalid purge if needed)
         let last_log_id = inner.log.values().next_back().map(|e| e.log_id);
         if let Some(ref purged) = inner.last_purged_log_id {
@@ -783,8 +790,10 @@ impl WalLogStore {
                 inner.log.clear();
             }
         }
+    }
 
-        // Step 2: Repair committed to point to a valid entry (AFTER truncation)
+    fn repair_committed_after_recovery(inner: &mut MemLogStoreInner) {
+        // Step 4: Repair committed to point to a valid entry (AFTER truncation)
         // Must satisfy both:
         //   - Invariant #4: committed <= last_log_id (LogId comparison)
         //   - Invariant #8: committed.index in log OR committed.index <= purged.index
@@ -814,89 +823,97 @@ impl WalLogStore {
         entries: &[Bytes],
         inner: &mut MemLogStoreInner,
     ) -> Result<(), OctopiiError> {
-        let mut log_entry_count = 0usize;
-        let mut vote_count = 0usize;
-        let mut committed_count = 0usize;
-        let mut purged_count = 0usize;
-        let mut truncated_count = 0usize;
+        let mut stats = WalReplayStats::default();
         for raw in entries {
             let record: WalLogRecord = bincode::deserialize(raw)
                 .map_err(|e| OctopiiError::Wal(format!("Failed to deserialize WAL record: {e}")))?;
-            match record {
-                WalLogRecord::LogEntry(entry) => {
-                    log_entry_count += 1;
-                    inner.log.insert(entry.log_id.index, entry);
-                }
-                WalLogRecord::Vote(vote) => {
-                    vote_count += 1;
-                    inner.vote = Some(vote);
-                }
-                WalLogRecord::Committed(committed) => {
-                    committed_count += 1;
-                    inner.committed = committed;
-                }
-                WalLogRecord::Purged(log_id) => {
-                    purged_count += 1;
-                    let keys = inner
-                        .log
-                        .range(..=log_id.index)
-                        .map(|(idx, _)| *idx)
-                        .collect::<Vec<_>>();
-                    for key in keys {
-                        inner.log.remove(&key);
-                    }
-                    inner.last_purged_log_id = Some(log_id);
-                }
-                WalLogRecord::Truncated(log_id) => {
-                    truncated_count += 1;
-                    let keys = inner
-                        .log
-                        .range(log_id.index..)
-                        .map(|(idx, _)| *idx)
-                        .collect::<Vec<_>>();
-                    for key in keys {
-                        inner.log.remove(&key);
-                    }
-                }
+            Self::apply_wal_record(inner, record, &mut stats);
+        }
+        stats.maybe_log();
+        Ok(())
+    }
+
+    fn apply_wal_record(
+        inner: &mut MemLogStoreInner,
+        record: WalLogRecord,
+        stats: &mut WalReplayStats,
+    ) {
+        match record {
+            WalLogRecord::LogEntry(entry) => {
+                stats.log_entry += 1;
+                inner.log.insert(entry.log_id.index, entry);
+            }
+            WalLogRecord::Vote(vote) => {
+                stats.vote += 1;
+                inner.vote = Some(vote);
+            }
+            WalLogRecord::Committed(committed) => {
+                stats.committed += 1;
+                inner.committed = committed;
+            }
+            WalLogRecord::Purged(log_id) => {
+                stats.purged += 1;
+                inner.remove_through(log_id.index);
+                inner.last_purged_log_id = Some(log_id);
+            }
+            WalLogRecord::Truncated(log_id) => {
+                stats.truncated += 1;
+                inner.remove_from(log_id.index);
             }
         }
-        if cfg!(feature = "simulation")
-            && std::env::var("CLUSTER_DEBUG").ok().as_deref() == Some("1")
-        {
-            eprintln!(
-                "[cluster_debug] wal_log_store apply counts: log_entry={} vote={} committed={} purged={} truncated={}",
-                log_entry_count, vote_count, committed_count, purged_count, truncated_count
-            );
-        }
-        Ok(())
     }
 
     async fn persist_record(&self, record: &WalLogRecord) -> Result<(), io::Error> {
         let data =
             bincode::serialize(record).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        #[cfg(feature = "simulation")]
+        append_wal_record(&self.wal, Bytes::from(data)).await
+    }
+}
+
+#[derive(Default)]
+struct WalReplayStats {
+    log_entry: usize,
+    vote: usize,
+    committed: usize,
+    purged: usize,
+    truncated: usize,
+}
+
+impl WalReplayStats {
+    fn maybe_log(&self) {
+        if cfg!(feature = "simulation")
+            && std::env::var("CLUSTER_DEBUG").ok().as_deref() == Some("1")
         {
-            for attempt in 0..20 {
-                match self.wal.append(Bytes::from(data.clone())).await {
-                    Ok(_) => return Ok(()),
-                    Err(e) => {
-                        if attempt == 19 {
-                            return Err(io::Error::new(io::ErrorKind::Other, e.to_string()));
-                        }
-                        sim_runtime::advance_time(Duration::from_millis(10));
-                        yield_now().await;
+            eprintln!(
+                "[cluster_debug] wal_log_store apply counts: log_entry={} vote={} committed={} purged={} truncated={}",
+                self.log_entry, self.vote, self.committed, self.purged, self.truncated
+            );
+        }
+    }
+}
+
+async fn append_wal_record(wal: &WriteAheadLog, data: Bytes) -> io::Result<()> {
+    #[cfg(feature = "simulation")]
+    {
+        for attempt in 0..20 {
+            match wal.append(data.clone()).await {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    if attempt == 19 {
+                        return Err(io::Error::new(io::ErrorKind::Other, e.to_string()));
                     }
+                    sim_runtime::advance_time(Duration::from_millis(10));
+                    yield_now().await;
                 }
             }
-            return Ok(());
         }
-        #[cfg(not(feature = "simulation"))]
-        {
-            self.wal
-                .append(Bytes::from(data))
-                .await
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-        }
+        return Ok(());
+    }
+    #[cfg(not(feature = "simulation"))]
+    {
+        wal.append(data)
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         Ok(())
     }
 }

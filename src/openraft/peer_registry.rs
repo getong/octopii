@@ -11,6 +11,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::RwLock as StdRwLock;
 use std::sync::Arc;
+use tokio::sync::RwLock as TokioRwLock;
 
 pub(crate) static GLOBAL_PEER_ADDRS: Lazy<StdRwLock<HashMap<String, HashMap<u64, SocketAddr>>>> =
     Lazy::new(|| StdRwLock::new(HashMap::new()));
@@ -94,5 +95,51 @@ pub(crate) async fn append_peer_addr_record(
     let bytes = bincode::serialize(&PeerAddrRecord { peer_id, addr })
         .map_err(|e| OctopiiError::Wal(format!("peer addr encode: {e}")))?;
     wal.append(Bytes::from(bytes)).await?;
+    Ok(())
+}
+
+pub(crate) async fn persist_peer_addr(
+    peer_addrs: &TokioRwLock<HashMap<u64, SocketAddr>>,
+    wal: &Arc<WriteAheadLog>,
+    namespace: &str,
+    peer_id: u64,
+    addr: SocketAddr,
+) -> Result<()> {
+    let mut needs_persist = false;
+    {
+        let mut map = peer_addrs.write().await;
+        if map.get(&peer_id).copied() != Some(addr) {
+            map.insert(peer_id, addr);
+            needs_persist = true;
+        }
+    }
+
+    register_global_peer_addr(namespace, peer_id, addr);
+
+    if needs_persist {
+        let append_res = append_peer_addr_record(wal, peer_id, addr).await;
+        if append_res.is_err() {
+            sim_assert(false, "peer addr WAL append failed after map update");
+        }
+        append_res?;
+        #[cfg(feature = "simulation")]
+        {
+            if let Ok(entries) = wal.read_all().await {
+                let mut last_addr: Option<SocketAddr> = None;
+                for raw in entries {
+                    if let Ok(record) = bincode::deserialize::<PeerAddrRecord>(&raw) {
+                        if record.peer_id == peer_id {
+                            last_addr = Some(record.addr);
+                        }
+                    }
+                }
+                sim_assert(
+                    last_addr == Some(addr),
+                    "peer addr WAL last record mismatch after append",
+                );
+            }
+        }
+    }
+
     Ok(())
 }

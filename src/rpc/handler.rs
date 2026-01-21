@@ -150,6 +150,39 @@ impl RpcHandler {
         })
     }
 
+    pub async fn register_peer_receiver(
+        self: &Arc<Self>,
+        addr: SocketAddr,
+        peer: Arc<dyn Peer>,
+    ) {
+        self.ensure_peer_receiver(addr, peer).await;
+    }
+
+    pub fn spawn_accept_loop(self: &Arc<Self>, transport: Arc<dyn Transport>) {
+        let rpc = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                match transport.accept().await {
+                    Ok((addr, peer)) => {
+                        tracing::debug!("Accepted connection from {}", addr);
+                        rpc.register_peer_receiver(addr, peer).await;
+                    }
+                    Err(e) => {
+                        // Don't break the loop on accept errors - just log and continue
+                        // This can happen during normal operation (e.g., connection refused, handshake failures)
+                        tracing::debug!("Failed to accept connection: {}", e);
+                        // Small delay to avoid tight loop on persistent errors
+                        if cfg!(feature = "simulation") {
+                            tokio::task::yield_now().await;
+                        } else {
+                            sim_time::sleep(Duration::from_millis(10)).await;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     /// Notify the handler of an incoming message
     ///
     /// This method handles the message inline to avoid spawning tasks,
