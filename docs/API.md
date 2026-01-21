@@ -5,7 +5,7 @@
 Octopii is a Rust-based distributed consensus and replication system built on top of the Raft consensus algorithm. This document covers every aspect of the external API that users interact with.
 
 **Core Features:**
-- Raft-based consensus using `raft-rs` and OpenRaft
+- Raft-based consensus using OpenRaft
 - QUIC transport layer via Quinn
 - Write-Ahead Log (WAL) for durability
 - RPC framework for request/response messaging

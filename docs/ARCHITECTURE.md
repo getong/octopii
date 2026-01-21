@@ -248,18 +248,18 @@ enum RpcMessage {
 }
 
 enum RequestPayload {
-    RaftMessage(raft_rs::RaftMessage),    // raft-rs backend
-    OpenRaft(Vec<u8>),                     // openraft backend
-    Custom(Bytes),                         // user-defined
+    RaftMessage { message: Bytes },        // protobuf raft message (legacy)
+    OpenRaft { kind: String, data: Bytes }, // openraft backend
+    Custom { operation: String, data: Bytes }, // user-defined
 }
 
 enum ResponsePayload {
-    AppendEntries(AppendEntriesResponse),
-    RequestVote(RequestVoteResponse),
-    Snapshot(SnapshotResponse),
-    OpenRaft(Vec<u8>),
-    CustomResponse(Bytes),
-    Error(String),
+    AppendEntriesResponse { term: u64, success: bool },
+    RequestVoteResponse { term: u64, vote_granted: bool },
+    SnapshotResponse { term: u64, success: bool },
+    OpenRaft { kind: String, data: Bytes },
+    CustomResponse { success: bool, data: Bytes },
+    Error { message: String },
 }
 ```
 
@@ -2058,10 +2058,8 @@ OpenRaft integration:
 - `network.rs`: `QuinnNetwork`, `QuinnNetworkFactory`
 
 ### src/raft/
-raft-rs integration for simulation mode (`simulation` feature):
-- `node.rs`: `RaftNode` (TiKV-style RawNode API)
-- `storage.rs`: `WalStorage` with two-phase commit for crash recovery testing
-- Used by DST harness for deterministic fault injection
+Simulation state machine utilities (`simulation` feature):
+- `state_machine.rs`: Durable KV state machine with snapshot/compaction helpers
 
 ### src/chunk.rs
 Chunk transfer primitives:

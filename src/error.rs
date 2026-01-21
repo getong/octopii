@@ -30,11 +30,4 @@ pub enum OctopiiError {
     NodeNotFound(u64),
 }
 
-#[cfg(feature = "simulation")]
-impl From<raft::Error> for OctopiiError {
-    fn from(err: raft::Error) -> Self {
-        OctopiiError::Wal(format!("raft error: {err}"))
-    }
-}
-
 pub type Result<T> = std::result::Result<T, OctopiiError>;

@@ -16,7 +16,7 @@ Octopii is a distributed systems kernel that provides the fundamental primitives
 
 ### Core Components
 
-- **Raft Consensus** - Two implementations: OpenRaft (async, production) and raft-rs (simulation mode)
+- **Raft Consensus** - OpenRaft for production and deterministic simulation
 - **Walrus WAL** - Custom Write-Ahead Log with two-phase commit, dual-topic durability, and crash recovery
 - **QUIC Transport** - Encrypted, multiplexed networking with connection pooling via Quinn
 - **Deterministic Simulation** - Controlled time, I/O fault injection, and reproducible randomness for crash testing

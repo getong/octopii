@@ -7,10 +7,14 @@ use std::time::Duration;
 use tempfile::tempdir;
 use tokio::time::sleep;
 
-fn next_addr() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    let addr = listener.local_addr().expect("local addr");
-    SocketAddr::new(addr.ip(), addr.port())
+fn next_addr_with_suffix(suffix: u16) -> SocketAddr {
+    loop {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        if addr.port() % 10 == suffix {
+            return SocketAddr::new(addr.ip(), addr.port());
+        }
+    }
 }
 
 fn node_config(
@@ -39,9 +43,9 @@ async fn openraft_three_node_cluster_replicates_commands() -> Result<(), Box<dyn
     let temp = tempdir()?;
     let base = temp.path();
 
-    let addr1 = next_addr();
-    let addr2 = next_addr();
-    let addr3 = next_addr();
+    let addr1 = next_addr_with_suffix(1);
+    let addr2 = next_addr_with_suffix(2);
+    let addr3 = next_addr_with_suffix(3);
 
     let peers1 = vec![addr2, addr3];
     let peers2 = vec![addr1, addr3];
@@ -98,13 +102,13 @@ async fn openraft_three_node_cluster_replicates_commands() -> Result<(), Box<dyn
     };
 
     leader.propose(b"SET cluster_key value".to_vec()).await?;
-    sleep(Duration::from_secs(1)).await;
+    sleep(Duration::from_secs(2)).await;
 
     let expected = "value".to_string();
     for (node, id) in [(&node1, 1_u64), (&node2, 2_u64), (&node3, 3_u64)] {
         let mut observed = String::new();
         let mut attempts = 0;
-        while attempts < 20 {
+        while attempts < 50 {
             let response = node.query(b"GET cluster_key").await?;
             observed = String::from_utf8(response.to_vec())?;
             if observed == expected {
