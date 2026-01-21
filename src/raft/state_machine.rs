@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use crate::invariants::sim_assert;
+use crate::state_machine::{parse_kv_command, KvCommand, StateMachineTrait};
 use rkyv::{Archive, Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -10,95 +11,6 @@ const TOPIC_STATE_MACHINE_SNAPSHOT: &str = "state_machine_snapshot";
 // State machine compaction threshold: checkpoint after this many operations
 const STATE_MACHINE_COMPACTION_THRESHOLD: usize = 5000;
 
-/// Trait for implementing custom replicated state machines
-///
-/// Implement this trait to create your own state machine that will be
-/// replicated across the Raft cluster. The trait provides methods for:
-/// - Applying commands to the state machine
-/// - Creating and restoring snapshots
-/// - Compaction for long-term storage efficiency
-///
-/// # Example
-///
-/// ```rust
-/// use octopii::raft::StateMachineTrait;
-/// use bytes::Bytes;
-///
-/// struct CounterStateMachine {
-///     counter: std::sync::RwLock<u64>,
-/// }
-///
-/// impl StateMachineTrait for CounterStateMachine {
-///     fn apply(&self, command: &[u8]) -> Result<Bytes, String> {
-///         // Parse command and update counter
-///         // ...
-///         Ok(Bytes::from("OK"))
-///     }
-///
-///     fn snapshot(&self) -> Vec<u8> {
-///         // Serialize current state
-///         // ...
-///         vec![]
-///     }
-///
-///     fn restore(&self, snapshot: &[u8]) -> Result<(), String> {
-///         // Deserialize and restore state
-///         Ok(())
-///     }
-///
-///     fn compact(&self) -> Result<(), String> {
-///         // Optional: perform compaction
-///         Ok(())
-///     }
-/// }
-/// ```
-pub trait StateMachineTrait: Send + Sync {
-    /// Apply a command to the state machine
-    ///
-    /// This method is called when a command is committed by Raft. The implementation
-    /// should be deterministic - given the same command sequence, all replicas must
-    /// produce the same state.
-    ///
-    /// # Arguments
-    /// * `command` - The command bytes to apply (format is implementation-defined)
-    ///
-    /// # Returns
-    /// * `Ok(Bytes)` - The result of applying the command
-    /// * `Err(String)` - An error message if the command is invalid
-    fn apply(&self, command: &[u8]) -> Result<Bytes, String>;
-
-    /// Create a snapshot of the current state
-    ///
-    /// Snapshots are used for:
-    /// - Fast recovery after crashes
-    /// - Catching up slow followers
-    /// - Log compaction
-    ///
-    /// # Returns
-    /// A byte vector containing the serialized state
-    fn snapshot(&self) -> Vec<u8>;
-
-    /// Restore state from a snapshot
-    ///
-    /// This method is called when loading a snapshot, either during recovery
-    /// or when catching up as a follower.
-    ///
-    /// # Arguments
-    /// * `snapshot` - The snapshot bytes to restore from
-    ///
-    /// # Returns
-    /// * `Ok(())` - Snapshot successfully restored
-    /// * `Err(String)` - An error message if the snapshot is invalid
-    fn restore(&self, snapshot: &[u8]) -> Result<(), String>;
-
-    /// Compact the state machine (optional)
-    ///
-    /// Called periodically to allow the state machine to compact its internal
-    /// state and reclaim space. The default implementation does nothing.
-    fn compact(&self) -> Result<(), String> {
-        Ok(())
-    }
-}
 
 // Serializable types for KV state machine data
 #[derive(Archive, Deserialize, Serialize, Debug, Clone)]
@@ -314,10 +226,13 @@ impl KvStateMachine {
         let cmd_str =
             String::from_utf8(command.to_vec()).map_err(|e| format!("Invalid UTF-8: {}", e))?;
 
-        let parts: Vec<&str> = cmd_str.split_whitespace().collect();
+        let parsed = match parse_kv_command(&cmd_str) {
+            Ok(cmd) => cmd,
+            Err(_) => return Err(format!("Unknown command: {}", cmd_str)),
+        };
 
-        match parts.as_slice() {
-            ["SET", key, value] => {
+        match parsed {
+            KvCommand::Set { key, value } => {
                 let key_str = key.to_string();
                 let value_bytes = Bytes::from(value.to_string());
 
@@ -348,14 +263,14 @@ impl KvStateMachine {
 
                 Ok(Bytes::from("OK"))
             }
-            ["GET", key] => {
+            KvCommand::Get { key } => {
                 let data = self.data.read().unwrap();
-                match data.get(*key) {
+                match data.get(key) {
                     Some(value) => Ok(value.clone()),
                     None => Ok(Bytes::from("NOT_FOUND")),
                 }
             }
-            ["DELETE", key] => {
+            KvCommand::Delete { key } => {
                 // Persist tombstone to Walrus
                 if let Some(wal) = &self.wal {
                     let sm_entry = StateMachineEntry {
@@ -375,14 +290,13 @@ impl KvStateMachine {
                 }
 
                 let mut data = self.data.write().unwrap();
-                data.remove(*key);
+                data.remove(key);
 
                 // Increment ops counter for compaction tracking
                 *self.ops_since_compaction.write().unwrap() += 1;
 
                 Ok(Bytes::from("OK"))
             }
-            _ => Err(format!("Unknown command: {}", cmd_str)),
         }
     }
 
@@ -502,7 +416,3 @@ impl StateMachineTrait for KvStateMachine {
         self.compact_state_machine()
     }
 }
-
-/// Type alias for backward compatibility and ease of use
-/// Represents a trait object that can be any state machine implementation
-pub type StateMachine = Arc<dyn StateMachineTrait>;

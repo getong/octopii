@@ -3,6 +3,7 @@ use super::{
 };
 use crate::error::{OctopiiError, Result};
 use crate::transport::{Peer, Transport};
+use crate::sim_time;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -10,7 +11,7 @@ use std::sync::Arc;
 use std::future::Future;
 use std::pin::Pin;
 use tokio::sync::{oneshot, Mutex, RwLock};
-use tokio::time::{timeout, Duration};
+use tokio::time::Duration;
 
 pub type RequestHandlerFuture = Pin<Box<dyn Future<Output = ResponsePayload> + Send>>;
 
@@ -58,15 +59,13 @@ impl RpcHandler {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let request = RpcMessage::new_request(id, payload.clone());
 
-        tracing::debug!(
-            "RPC request {} to {}: {:?}",
-            id,
-            addr,
-            match &payload {
-                super::RequestPayload::OpenRaft { kind, .. } => format!("OpenRaft({})", kind),
-                _ => "Other".to_string(),
-            }
-        );
+        let payload_kind = match &payload {
+            #[cfg(feature = "openraft")]
+            super::RequestPayload::OpenRaft { kind, .. } => format!("OpenRaft({})", kind),
+            _ => "Other".to_string(),
+        };
+
+        tracing::debug!("RPC request {} to {}: {:?}", id, addr, payload_kind);
 
         let (tx, rx) = oneshot::channel();
 
@@ -94,7 +93,7 @@ impl RpcHandler {
         self.ensure_peer_receiver(addr, Arc::clone(&peer)).await;
 
         tracing::debug!("RPC request {}: sending data to {}", id, addr);
-        timeout(timeout_duration, peer.send(data))
+        sim_time::timeout(timeout_duration, peer.send(data))
             .await
             .map_err(|_| {
                 tracing::error!("RPC request {}: send timeout to {}", id, addr);
@@ -112,7 +111,7 @@ impl RpcHandler {
 
         tracing::debug!("RPC request {}: waiting for response from {}", id, addr);
         // Wait for response with timeout
-        match timeout(timeout_duration, rx).await {
+        match sim_time::timeout(timeout_duration, rx).await {
             Ok(Ok(response)) => {
                 tracing::debug!("RPC request {}: received response from {}", id, addr);
                 Ok(response)

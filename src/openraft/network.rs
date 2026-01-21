@@ -1,6 +1,6 @@
 #![cfg(feature = "openraft")]
 
-use crate::openraft::node::global_peer_addr;
+use crate::openraft::peer_registry::global_peer_addr;
 use crate::openraft::types::{AppNodeId, AppTypeConfig};
 use crate::rpc::{RequestPayload, ResponsePayload, RpcHandler};
 use openraft::{

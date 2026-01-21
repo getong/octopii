@@ -3,6 +3,37 @@ use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 
+pub(crate) enum KvCommand<'a> {
+    Set { key: &'a str, value: &'a str },
+    Get { key: &'a str },
+    Delete { key: &'a str },
+}
+
+pub(crate) fn parse_kv_command(command: &str) -> std::result::Result<KvCommand<'_>, String> {
+    let mut tokens = command.split_whitespace();
+    let op = tokens.next().unwrap_or("");
+    match op {
+        "SET" => {
+            let key = tokens.next().ok_or_else(|| "SET missing key".to_string())?;
+            let val = tokens
+                .next()
+                .ok_or_else(|| "SET missing value".to_string())?;
+            Ok(KvCommand::Set { key, value: val })
+        }
+        "GET" => {
+            let key = tokens.next().ok_or_else(|| "GET missing key".to_string())?;
+            Ok(KvCommand::Get { key })
+        }
+        "DELETE" => {
+            let key = tokens
+                .next()
+                .ok_or_else(|| "DELETE missing key".to_string())?;
+            Ok(KvCommand::Delete { key })
+        }
+        _ => Err("unknown op".into()),
+    }
+}
+
 /// Trait for application state machines.
 pub trait StateMachineTrait: Send + Sync {
     fn apply(&self, command: &[u8]) -> std::result::Result<Bytes, String>;
@@ -33,36 +64,25 @@ impl StateMachineTrait for KvStateMachine {
     fn apply(&self, command: &[u8]) -> std::result::Result<Bytes, String> {
         // Protocol: "SET key value" | "GET key" | "DELETE key"
         let s = std::str::from_utf8(command).map_err(|e| e.to_string())?;
-        let mut tokens = s.split_whitespace();
-        let op = tokens.next().unwrap_or("");
-        match op {
-            "SET" => {
-                let key = tokens.next().ok_or_else(|| "SET missing key".to_string())?;
-                let val = tokens
-                    .next()
-                    .ok_or_else(|| "SET missing value".to_string())?;
+        match parse_kv_command(s)? {
+            KvCommand::Set { key, value } => {
                 self.map
                     .lock()
                     .unwrap()
-                    .insert(key.as_bytes().to_vec(), val.as_bytes().to_vec());
+                    .insert(key.as_bytes().to_vec(), value.as_bytes().to_vec());
                 Ok(Bytes::from("OK"))
             }
-            "GET" => {
-                let key = tokens.next().ok_or_else(|| "GET missing key".to_string())?;
+            KvCommand::Get { key } => {
                 let val_opt = self.map.lock().unwrap().get(key.as_bytes()).cloned();
                 match val_opt {
                     Some(v) => Ok(Bytes::from(v)),
                     None => Ok(Bytes::from("NOT_FOUND")),
                 }
             }
-            "DELETE" => {
-                let key = tokens
-                    .next()
-                    .ok_or_else(|| "DELETE missing key".to_string())?;
+            KvCommand::Delete { key } => {
                 self.map.lock().unwrap().remove(key.as_bytes());
                 Ok(Bytes::from("OK"))
             }
-            _ => Err("unknown op".into()),
         }
     }
 

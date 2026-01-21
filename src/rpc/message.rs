@@ -28,6 +28,7 @@ pub enum RequestPayload {
     /// Generic Raft message serialized via protobuf
     RaftMessage { message: Bytes },
     /// OpenRaft generic message (serde) - kind indicates RPC type
+    #[cfg(feature = "openraft")]
     OpenRaft { kind: String, data: Bytes },
     /// Custom application-level request
     Custom { operation: String, data: Bytes },
@@ -50,6 +51,7 @@ pub enum ResponsePayload {
     /// Snapshot response
     SnapshotResponse { term: u64, success: bool },
     /// OpenRaft generic response (serde) - kind indicates RPC type
+    #[cfg(feature = "openraft")]
     OpenRaft { kind: String, data: Bytes },
     /// Custom application response
     CustomResponse { success: bool, data: Bytes },

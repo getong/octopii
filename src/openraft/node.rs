@@ -5,6 +5,10 @@ use crate::error::Result;
 #[cfg(feature = "openraft-filters")]
 use crate::openraft::network::OpenRaftFilters;
 use crate::openraft::network::{QuinnNetwork, QuinnNetworkFactory};
+use crate::openraft::peer_registry::{
+    append_peer_addr_record, cluster_namespace_from_wal_dir, global_peer_addr,
+    load_peer_addr_records, register_global_peer_addr, PeerAddrRecord,
+};
 use crate::openraft::storage::new_wal_log_store;
 use crate::openraft::storage::MemStateMachine;
 use crate::openraft::types::{AppEntry, AppNodeId, AppResponse, AppTypeConfig};
@@ -13,102 +17,22 @@ use crate::state_machine::{KvStateMachine, StateMachine};
 use crate::transport::Transport;
 use crate::wal::WriteAheadLog;
 use crate::invariants::sim_assert;
+use crate::sim_time;
 use bytes::Bytes;
-use once_cell::sync::Lazy;
 use openraft::impls::BasicNode;
 use openraft::metrics::RaftMetrics;
 use openraft::storage::{LogState, RaftLogReader, RaftLogStorage};
 use openraft::{Config as RaftConfig, LogId, Raft, ServerState, Vote};
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock as StdRwLock};
+use std::sync::Arc;
 use std::io;
 use tokio::sync::RwLock;
 use tokio::time::Duration;
 
-pub(crate) static GLOBAL_PEER_ADDRS: Lazy<StdRwLock<HashMap<String, HashMap<u64, SocketAddr>>>> =
-    Lazy::new(|| StdRwLock::new(HashMap::new()));
-
-fn namespace_key_from_path(path: &std::path::Path) -> String {
-    path.to_string_lossy().to_string()
-}
-
-fn cluster_namespace_from_wal_dir(wal_dir: &std::path::Path) -> String {
-    match wal_dir.parent() {
-        Some(parent) => namespace_key_from_path(parent),
-        None => namespace_key_from_path(wal_dir),
-    }
-}
-
-pub fn peer_namespace_from_base(path: &std::path::Path) -> String {
-    namespace_key_from_path(path)
-}
-
-pub(crate) fn register_global_peer_addr(namespace: &str, node_id: u64, addr: SocketAddr) {
-    let mut map = GLOBAL_PEER_ADDRS.write().unwrap();
-    map.entry(namespace.to_string()).or_default().insert(node_id, addr);
-}
-
-pub(crate) fn global_peer_addr(namespace: &str, peer_id: u64) -> Option<SocketAddr> {
-    GLOBAL_PEER_ADDRS
-        .read()
-        .unwrap()
-        .get(namespace)
-        .and_then(|m| m.get(&peer_id).copied())
-}
-
-pub fn clear_global_peer_addrs_for(namespace: &str) {
-    GLOBAL_PEER_ADDRS.write().unwrap().remove(namespace);
-}
-
-pub fn clear_global_peer_addrs() {
-    GLOBAL_PEER_ADDRS.write().unwrap().clear();
-}
-
-#[derive(Serialize, Deserialize)]
-struct PeerAddrRecord {
-    peer_id: u64,
-    addr: SocketAddr,
-}
-
-async fn load_peer_addr_records(wal: &Arc<WriteAheadLog>) -> HashMap<u64, SocketAddr> {
-    let mut map = HashMap::new();
-    if let Ok(entries) = wal.read_all().await {
-        for raw in entries {
-            if let Ok(record) = bincode::deserialize::<PeerAddrRecord>(&raw) {
-                map.insert(record.peer_id, record.addr);
-            }
-        }
-    }
-    #[cfg(feature = "simulation")]
-    {
-        if let Ok(entries) = wal.read_all().await {
-            let mut verify = HashMap::new();
-            for raw in entries {
-                if let Ok(record) = bincode::deserialize::<PeerAddrRecord>(&raw) {
-                    verify.insert(record.peer_id, record.addr);
-                }
-            }
-            sim_assert(
-                verify == map,
-                "peer addr WAL recovery not idempotent across replay",
-            );
-        }
-    }
-    map
-}
-
-async fn append_peer_addr_record(
-    wal: &Arc<WriteAheadLog>,
-    peer_id: u64,
-    addr: SocketAddr,
-) -> Result<()> {
-    let bytes = bincode::serialize(&PeerAddrRecord { peer_id, addr })
-        .map_err(|e| crate::error::OctopiiError::Wal(format!("peer addr encode: {e}")))?;
-    wal.append(Bytes::from(bytes)).await?;
-    Ok(())
-}
+pub use crate::openraft::peer_registry::{
+    clear_global_peer_addrs, clear_global_peer_addrs_for, peer_namespace_from_base,
+};
 
 /// OpenRaft-based node
 pub struct OpenRaftNode {
@@ -256,7 +180,7 @@ impl OpenRaftNode {
                         if cfg!(feature = "simulation") {
                             tokio::task::yield_now().await;
                         } else {
-                            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                            sim_time::sleep(Duration::from_millis(10)).await;
                         }
                     }
                 }
