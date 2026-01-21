@@ -6,7 +6,7 @@ on:
 
 jobs:
   cluster-simulation-parallel:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
