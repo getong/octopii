@@ -136,7 +136,7 @@ jobs:
         run: rm -rf /tmp/octopii_test_* /tmp/walrus_* /tmp/custom_sm_test_* || true
 
   openraft-cluster-integration:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
